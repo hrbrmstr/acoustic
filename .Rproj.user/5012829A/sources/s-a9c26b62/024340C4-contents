@@ -1,0 +1,402 @@
+---
+title: "Acoustic"
+output: 
+    github_document:
+      toc: true
+editor_options: 
+  chunk_output_type: console
+---
+
+(See [this document](https://github.com/hrbrmstr/packet-maze-example) for what's going on here).
+
+[This challenge](https://cyberdefenders.org/labs/46) takes us _"into the world of voice communications on the internet. VoIP is becoming the de-facto standard for voice communication. As this technology becomes more common, malicious parties have more opportunities and stronger motives to control these systems to conduct nefarious activities. This challenge was designed to examine and explore some of the attributes of the SIP and RTP protocols."_
+
+We have two files to work with:
+
+- `log.txt` which was generated from an unadvertised, passive honeypot located on the internet such that any traffic destined to it must be nefarious. Unknown parties scanned the honeypot with a range of tools, and this activity is represented in the log file.
+    - The IP address of the honeypot has been changed to "`honey.pot.IP.removed`". In terms of geolocation, pick your favorite city.
+    - The MD5 hash in the authorization digest is replaced with "`MD5_hash_removedXXXXXXXXXXXXXXXX`"
+    - Some octets of external IP addresses have been replaced with an "X"
+    - Several trailing digits of phone numbers have been replaced with an "X"
+    - Assume the timestamps in the log files are UTC.
+- `Voip-trace.pcap` was created by honeynet members for this forensic challenge to allow participants to employ network analysis skills in the VOIP context.
+
+There are 14 questions to answer.
+
+If you are not familiar with [SIP](https://en.wikipedia.org/wiki/Session_Initiation_Protocol) and/or [RTP](https://en.wikipedia.org/wiki/Real-time_Transport_Protocol) you should do a bit of research first. A good place to start is [RTC 3261](https://www.rfc-editor.org/rfc/rfc3261.html) (for SIP) and [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550) (for RTC). Some questions may be able to be answered just by knowing the details of these protocols.
+
+## Convert the PCAP
+
+```{r libs}
+library(stringi)
+library(tidyverse)
+```
+
+We'll pre-generate Zeek logs. The `-C` tells Zeek to not bother with checksums, `-r` tells it to read from a file and the `LogAscii::use_json=T` means we want JSON output vs the default delimited files. JSON gives us data types (the headers in the delimited files do as well, but we'd have to write something to read those types then deal with it vs get this for free out of the box with JSON).
+
+```{r process-pcap-tshark-zeek-01}
+system("ZEEK_LOG_SUFFIX=json /opt/zeek/bin/zeek -C -r src/Voip-trace.pcap LogAscii::use_json=T HTTP::default_capture_password=T")
+```
+
+We process the PCAP twice with `tshark`. Once to get the handy (and small) packet summary table, then dump the whole thing to JSON. We may need to run `tshark` again down the road a bit.
+
+```{r process-pcap-tshark-zeek-02}
+system("tshark -T tabs -r src/Voip-trace.pcap > voip-packets.tsv")
+system("tshark -T json -r src/Voip-trace.pcap > voip-trace")
+```
+
+## Examine and Process `log.txt`
+
+We aren't told what format `log.txt` is in, so let's take a look:
+
+```{r process-sip-log-01}
+cd_sip_log <- stri_read_lines("src/log.txt")
+
+cat(head(cd_sip_log, 25), sep="\n")
+```
+
+These look _a bit_ like [HTTP server responses](https://developer.mozilla.org/en-US/docs/Web/HTTP/Messages), but we know we're working in SIP land and if you perused the RFC you'd have noticed that SIP is an HTTP-like ASCII protocol. While some HTTP response parsers _might_ work on these records, it's pretty straightforward to whip up a bespoke pseudo-parser.
+
+Let's see how many records there are by counting the number of "`Message:`" lines (we're doing this, primarily, to see if we should use the `{furrr}` package to speed up processing):
+
+```{r process-sip-log-02}
+cd_sip_log[stri_detect_fixed(cd_sip_log, "Message:")] %>%
+  table()
+```
+
+There are many, so we'll avoid parallel processing the data and just use a single thread.
+
+One way to tackle the parsing is to look for the stop and start of each record, extract fields (these have similar formats to HTTP headers), and perhaps have to extract content as well. We know this because there are "`Content-Length:`" fields. [According to the RFC](https://www.rfc-editor.org/rfc/rfc3261.html#section-20.14) they are supposed to exist for every message. Let's first see if any "`Content-Length:`" header records are greater than 0. We'll do this with a little help from the [`ripgrep`](https://github.com/BurntSushi/ripgrep) utility as it provides a way to see context before and/or after matched patterns:
+
+```{r process-sip-log-03}
+cat(system('rg --after-context=10 "^Content-Length: [^0]" src/log.txt', intern=TRUE), sep="\n")
+```
+
+So,we _do_ need to account for content. It's still pretty straightforward (explanatory comments inline):
+
+```{r process-sip-log-04}
+starts <- which(stri_detect_regex(cd_sip_log, "^Source:"))
+stops <- which(stri_detect_regex(cd_sip_log, "^----------"))
+
+map2_dfr(starts, stops, ~{
+
+  raw_rec <- stri_trim_both(cd_sip_log[.x:.y]) # target the record from the log
+  raw_rec <- raw_rec[raw_rec != "-------------------------"] # remove separator
+
+  msg_idx <- which(stri_detect_regex(raw_rec, "^Message:")) # find where "Message:" line is
+  source_idx <- which(stri_detect_regex(raw_rec, "^Source: ")) # find where "Source:" line is
+  datetime_idx <- which(stri_detect_regex(raw_rec, "^Datetime: ")) # find where "Datetime:" line is
+  contents_idx <- which(stri_detect_regex(raw_rec[(msg_idx+2):length(raw_rec)], "^$"))[1] + 2 # get position of the "data"
+
+  source <- stri_match_first_regex(raw_rec[source_idx], "^Source: (.*)$")[,2] # extract source
+  datetime <- stri_match_first_regex(raw_rec[datetime_idx], "^Datetime: (.*)$")[,2] # extract datetime
+  request <- raw_rec[msg_idx+2] # extract request line
+
+  # build a matrix out of the remaining headers. header key will be in column 2, value will be in column 3
+  tmp <- stri_match_first_regex(raw_rec[(msg_idx+3):contents_idx], "^([^:]+):[[:space:]]+(.*)$")
+  tmp[,2] <- stri_trans_tolower(tmp[,2]) # lowercase the header key
+  tmp[,2] <- stri_replace_all_fixed(tmp[,2], "-", "_") # turn dashes to underscores so we can more easily use the keys as column names
+
+  contents <- raw_rec[(contents_idx+1):length(raw_rec)]
+  contents <- paste0(contents[contents != ""], collapse = "\n")
+
+  as.list(tmp[,3]) %>% # turn the header values into a list
+    set_names(tmp[,2]) %>% # make their names the tranformed keys
+    append(c(
+      source = source, # add source to the list (etc)
+      datetime = datetime,
+      request = request,
+      contents = contents
+    ))
+
+}) -> sip_log_parsed
+```
+
+Let's see what we have:
+
+```{r process-sip-log-05}
+sip_log_parsed
+
+glimpse(sip_log_parsed)
+```
+
+Looks `r emo::ji("+1")`, but IRL there are edge-cases we'd have to deal with.
+
+## Process Zeek Logs
+
+Because they're JSON files, and the names are reasonable, we can do some magic incantations to read them all in and shove them into a list we'll call `zeek`:
+
+```{r process-zeek-logs-01}
+zeek <- list()
+
+list.files(
+  pattern = "json$",
+  full.names = TRUE
+) %>%
+  walk(~{
+    append(zeek, list(file(.x) %>% 
+      jsonlite::stream_in(verbose = FALSE) %>%
+      as_tibble()) %>% 
+        set_names(tools::file_path_sans_ext(basename(.x)))
+    ) ->> zeek
+  })
+
+str(zeek, 1)
+
+walk2(names(zeek), zeek, ~{
+  cat("File:", .x, "\n")
+  glimpse(.y)
+  cat("\n\n")
+})
+```
+
+## Process Packet Summary
+
+We won't process the big JSON file `tshark` generated for us util we really have to, but we can read in the packet summary table now:
+
+```{r process-packet-summary-01}
+packet_cols <- c("packet_num", "ts", "src", "discard", "dst", "proto", "length", "info")
+
+read_tsv(
+  file = "voip-packets.tsv",
+  col_names = packet_cols,
+  col_types = "ddccccdc"
+) %>%
+  select(-discard) -> packets
+
+packets
+
+glimpse(packets)
+```
+
+## What is the transport protocol being used?
+
+SIP can use TCP or UDP and which transport it uses will be specified in the [`Via:` header](https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.1.7). Let's take a look:
+
+```{r transport-protocol-01}
+head(sip_log_parsed$via)
+```
+
+Are they _all_ UDP? We can find out by performing some light processing on the `via` column:
+
+```{r transport-protocol-02}
+sip_log_parsed %>% 
+  select(via) %>% 
+  mutate(
+    transport = stri_match_first_regex(via, "^([^[:space:]]+)")[,2]
+  ) %>% 
+  count(transport, sort=TRUE)
+```
+
+Looks like they're all UDP. Question 1: `r emo::ji("white_check_mark")`
+
+## The attacker used a bunch of scanning tools that belong to the same suite. Provide the name of the suite.
+
+Don't you, now, wish you had listen to your parents when they were telling you about the facts of SIP life when you were a wee pup?
+
+We'll stick with the SIP log to answer this one and [peek back at the RFC](https://www.rfc-editor.org/rfc/rfc3261.html#section-20.41) to see that there's a "`User-Agent:`" field which contains information about the client originating the request. Most scanners written by defenders identify themselves in `User-Agent` fields when those fields are available in a protocol exchange, and a large percentage of naive malicious folks are too daft to change this value (or leave it default to make you think they're not behaving badly).
+
+If you are a regular visitor to SIP land, you likely know the common SIP scanning tools. These are a few:
+
+- [Nmap's SIP library](https://nmap.org/nsedoc/lib/sip.html)
+- [Mr.SIP](https://github.com/meliht/Mr.SIP), a "SIP-Based Audit and Attack Tool"
+- [SIPVicious](https://github.com/EnableSecurity/sipvicious), a "set of security tools that can be used to audit SIP based VoIP systems"
+- [Sippts](https://github.com/Pepelux/sippts), a "set of tools to audit SIP based VoIP Systems"
+
+(There are [many more](https://github.com/search?q=sip+audit).)
+
+Let's see what user-agent was used in this log extract:
+
+```{r}
+count(sip_log_parsed, user_agent, sort=TRUE)
+```
+The overwhelming majority are `friendly-scanner`. Let's look at a few of those log entries:
+
+```{r}
+sip_log_parsed %>% 
+  filter(
+    user_agent == "friendly-scanner"
+  ) %>% 
+  glimpse()
+```
+
+Those `from` and `to` fields have an interesting name in them: "`sipviscious`". You've seen that before, right at the beginning of this section.
+
+Let's do a quick check [over at the SIPvicious repo](https://github.com/EnableSecurity/sipvicious/search?q=friendly-scanner) just to make sure.
+
+```{r}
+count(sip_log_parsed, user_agent)
+```
+
+## "What is the User-Agent of the victim system?"
+
+We only have partial data in the text log so we'll have to look elsewhere (the PCAP) for this information. The "victim" is whatever was the target of a this SIP-based attack and we can look for SIP messages, user agents, and associated IPs in the PCAP thanks to `tshark`'s [rich SIP filter library](https://www.wireshark.org/docs/dfref/s/sip.html):
+
+```{r}
+system("tshark -Q -T fields -e ip.src -e ip.dst -e sip.User-Agent -r src/Voip-trace.pcap 'sip.User-Agent'")
+```
+
+That first exchange is all we really need. We see our rude poker talking to `172.25.105.40` and it responding right after.
+
+## Which tool was only used against the following extensions: 100, 101, 102, 103, and 111?
+
+The question is a tad vague and is assuming — since we now know the SIPvicious suite was used — that we also know to provide the [name of the Python script in SIPvicious](https://github.com/EnableSecurity/sipvicious/tree/master/sipvicious) that was used. There are five tools:
+
+- `svmap`: this is a sip scanner. When launched against ranges of ip address space, it will identify any SIP servers which it finds on the way. Also has the option to scan hosts on ranges of ports. Usage: <https://github.com/EnableSecurity/sipvicious/wiki/SVMap-Usage>
+- `svwar`: identifies working extension lines on a PBX. A working extension is one that can be registered. Also tells you if the extension line requires authentication or not. Usage: <https://github.com/EnableSecurity/sipvicious/wiki/SVWar-Usage>
+- `svcrack`: a password cracker making use of digest authentication. It is able to crack passwords on both registrar servers and proxy servers. Current cracking modes are either numeric ranges or words from dictionary files. Usage: <https://github.com/EnableSecurity/sipvicious/wiki/SVCrack-Usage>
+- `svreport`: able to manage sessions created by the rest of the tools and export to pdf, xml, csv and plain text. Usage: <https://github.com/EnableSecurity/sipvicious/wiki/SVReport-Usage>
+- `svcrash`: responds to `svwar` and `svcrack` SIP messages with a message that causes old versions to crash. Usage: <https://github.com/EnableSecurity/sipvicious/wiki/SVCrash-FAQ>
+
+The `svcrash` tool is something defenders can use to help curtail scanner activity. We can cross that off the list. The `svreport` tool is for working with data generated by `svmap`, `svwar` and/or `svcrack`. One more crossed off. We also know that the attacker scanned the SIP network looking for nodes, which means `svmap` and `svwar` are likely not exclusive tool to the target extensions. (We _technically_ have enough information right now to answer the question especially if you look carefully at the answer box on the site but that's cheating).
+
+The SIP request line and header field like ["`To:`"](https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.1.2) destination information in the form of a [SIP URI](https://www.rfc-editor.org/rfc/rfc3261.html#section-19.1). Since we only care about the extension component of the URI for this question, we can use a regular expression to isolate them.
+
+Back to the SIP log to see if we can find the identified extensions. We'll also process the "`From:`" header just in case we need it.
+
+```{r}
+sip_log_parsed %>% 
+  mutate_at(
+    vars(request, from, to),
+    ~stri_match_first_regex(.x, "sip:([^@]+)@")[,2]
+  ) %>% 
+  select(request, from, to)
+```
+
+That worked! We can now see what `friendly-scanner` attempted to authenticate only to our targets:
+
+```{r}
+sip_log_parsed %>%
+  mutate_at(
+    vars(request, from, to),
+    ~stri_match_first_regex(.x, "sip:([^@]+)@")[,2]
+  ) %>% 
+  filter(
+    user_agent == "friendly-scanner",
+    stri_detect_fixed(contents, "Authorization")
+  ) %>% 
+  distinct(to)
+```
+
+While we're missing `100` that's likely due to it not requiring authentication (`svcrack` will `REGISTER` first to determine if a target requires authentication and not send cracking requests if it doesn't).
+
+## Which extension on the honeypot does NOT require authentication?
+
+We know this due to what we found in the previous question. Extension `100` does not require authentication.
+
+## How many extensions were scanned in total?
+
+We just need to count the distinct `to`'s where the user agent is the scanner:
+
+```{r}
+sip_log_parsed %>% 
+  mutate_at(
+    vars(request, from, to),
+    ~stri_match_first_regex(.x, "sip:([^@]+)@")[,2]
+  ) %>% 
+  filter(
+    user_agent == "friendly-scanner"
+  ) %>% 
+  distinct(to)
+```
+
+## There is a trace for a real SIP client. What is the corresponding user-agent? (two words, once space in between)
+
+We only need to look for user agent's that aren't our scanner:
+
+```{r}
+sip_log_parsed %>% 
+  filter(
+    user_agent != "friendly-scanner"
+  ) %>% 
+  count(user_agent)
+```
+
+
+## Multiple real-world phone numbers were dialed. Provide the first 11 digits of the number dialed from extension 101?
+
+Calls are ["`INVITE`" requests](https://www.rfc-editor.org/rfc/rfc3261.html#section-13)
+
+```{r}
+sip_log_parsed %>% 
+  mutate_at(
+    vars(from, to),
+    ~stri_match_first_regex(.x, "sip:([^@]+)@")[,2]
+  ) %>% 
+  filter(
+    from == 101,
+    stri_detect_regex(cseq, "INVITE")
+  ) %>% 
+  select(to) 
+```
+
+The challenge answer box provides hint to what number they want. I'm not sure but I suspect it may be randomized, so you'll have to match the pattern they expect with the correct digits above.
+
+## What are the default credentials used in the attempted basic authentication? (format is username:password)
+
+This question wants us to look at the HTTP requests that require authentication. We can get he credentials info from the `zeek$http` log:
+
+```{r}
+zeek$http %>% 
+  distinct(username, password)
+```
+
+## Which codec does the RTP stream use? (3 words, 2 spaces in between)
+
+"Codec" refers to the algorithm used to encode/decode an audio or video stream. The RTP RFC uses the term ["payload type"](https://datatracker.ietf.org/doc/html/rfc3550#page-71) to refer to this during exchanges and even has a link to [RFC 3551 ](https://datatracker.ietf.org/doc/html/rfc3551) which provides further information on these encodings.
+
+The summary packet table that `tshark` generates helpfully provides summary `info` for RTP packets and part of that info is `PT=…` which indicates the payload type.
+
+```{r}
+packets %>% 
+  filter(proto == "RTP") %>% 
+  select(info)
+```
+
+## How long is the sampling time (in milliseconds)?
+
+- `1` Hz = `1,000` ms
+- `1` ms = `1,000` Hz
+
+`(1/8000) * 1000`
+
+## What was the password for the account with username 555?
+
+We don't really need to use external programs for this but it will sure go quite a bit faster if we do. While [the original reference page](https://web.archive.org/web/20080731070643/http://www.remote-exploit.org/codes_sipcrack.html) for `sipdump` and `sipcrack` is defunct, you can visit that link to go to the Wayback machine's capture of it. It will help if you have a linux system handy (so Docker to the rescue for macOS and Windows folks) since the following answer details are running on Ubunbu.
+
+This question is taking advantage of the fact that the default authentication method for SIP is extremely weak. The process uses an MD5 challenge/response, and if an attacker can capture call traffic it is possible to brute force the password offline (which is what we'll use `sipcrack` for).
+
+You can install them via `sudo apt install sipcrack`.
+
+We'll first generate a dump of the authentication attempts with `sipdump`:
+
+```{r echo=FALSE}
+res <- suppressWarnings(file.remove("sip.dump"))
+```
+```{r}
+system("sipdump -p src/Voip-trace.pcap sip.dump", intern=TRUE)
+
+cat(readLines("sip.dump"), sep="\n")
+```
+
+It saves the IPs, caller, authentication realm, method, nonce and hash which will all be fed into the `sipcrack`.
+
+We know from the placeholder answer text that the "password" is 4 characters, and this is the land of telephony, so we can make an assumption that it is really 4 digits. `sipcrack` needs a file of passwords to try, so We'll let R make a randomized file of 4 digit  pins for us:
+
+```{r}
+cat(sprintf("%04d", sample(0:9999)), file = "4-digits", sep="\n")
+```
+
+We only have authenticaton packets for `555` so we can automate what would normally be an interactive process:
+
+```{r}
+cat(system('echo "1" | sipcrack -w 4-digits sip.dump', intern=TRUE), sep="\n")
+```
+
+## Which RTP packet header field can be used to reorder out of sync RTP packets in the correct sequence?
+
+Just reading involved here: [5.1 RTP Fixed Header Fields](https://datatracker.ietf.org/doc/html/rfc3550#page-13).
+
+## The trace includes a secret hidden message. Can you hear it?
+
+We could command line this one but honestly Wireshark has a pretty keen audio player. Fire it up, open up the PCAP, go to the "Telephony" menu, pick SIP and play the streams.

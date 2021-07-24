@@ -1,0 +1,11 @@
+opt_reg = list(stri_match_first_regex(raw_rec[6], "^(OPTIONS|REGISTER) ([^@]+)@([^[:space:]]+) ([^/]+)/(.*)$")[,2:6]),
+via = list(stri_match_first_regex(raw_rec[7], "^Via: ([^[:space:]]+) (.*)$")[,2:3]),
+content_length = stri_match_first_regex(raw_rec[8], "^Content-Length: (.*)$")[,2],
+from = stri_match_first_regex(raw_rec[9], "^From: (.*)$")[,2],
+accept = stri_match_first_regex(raw_rec[10], "^Accept: (.*)$")[,2],
+user_agent = stri_match_first_regex(raw_rec[11], "^User-Agent: (.*)$")[,2],
+to = stri_match_first_regex(raw_rec[12], "^To: (.*)$")[,2],
+contact = stri_match_first_regex(raw_rec[13], "^Contact: (.*)$")[,2],
+cseq = stri_match_first_regex(raw_rec[14], "^CSeq: (.*)")[,2],
+call_id = stri_match_first_regex(raw_rec[15], "^Call-ID: (.*)$")[,2],
+max_forwards = stri_match_first_regex(raw_rec[16], "^Max-Forwards: (.*)")[,2]

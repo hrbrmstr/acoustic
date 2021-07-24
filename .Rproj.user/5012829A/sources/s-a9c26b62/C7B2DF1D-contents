@@ -1,0 +1,95 @@
+library(stringi)
+library(tidyverse)
+
+# https://cyberdefenders.org/labs/46
+
+system("ZEEK_LOG_SUFFIX=json /opt/zeek/bin/zeek -C -r src/Voip-trace.pcap LogAscii::use_json=T")
+system("tshark -T tabs -r src/Voip-trace.pcap > voip-packets.tsv")
+system("tshark -T json -r src/Voip-trace.pcap > voip-trace")
+
+cd_sip_log <- stri_read_lines("src/log.txt")
+
+head(cd_sip_log, 100)
+
+cd_sip_log[stri_detect_fixed(cd_sip_log, "Message:")] %>%
+  table()
+
+starts <- which(stri_detect_regex(cd_sip_log, "^Source:"))
+stops <- which(stri_detect_regex(cd_sip_log, "^----------"))
+
+map2_dfr(starts, stops, ~{
+
+  raw_rec <- stri_trim_both(cd_sip_log[.x:.y]) # target the record from the log
+  raw_rec <- raw_rec[raw_rec != "-------------------------"] # remove separator
+
+  msg_idx <- which(stri_detect_regex(raw_rec, "^Message:")) # find where "Message:" line is
+  source_idx <- which(stri_detect_regex(raw_rec, "^Source: ")) # find where "Source:" line is
+  datetime_idx <- which(stri_detect_regex(raw_rec, "^Datetime: ")) # find where "Datetime:" line is
+  contents_idx <- which(stri_detect_regex(raw_rec[(msg_idx+2):length(raw_rec)], "^$"))[1] + 2 # get position of the "data"
+
+  source <- stri_match_first_regex(raw_rec[source_idx], "^Source: (.*)$")[,2] # extract source
+  datetime <- stri_match_first_regex(raw_rec[datetime_idx], "^Datetime: (.*)$")[,2] # extract datetime
+  opt_reg <- list(stri_match_first_regex(raw_rec[msg_idx+2], "^(OPTIONS|REGISTER) ([^@]+)@([^[:space:]]+) ([^/]+)/(.*)$")[,2:6]) # extract start line
+
+  # build a matrix out of the remaining headers. header key will be in column 2, value will be in column 3
+  tmp <- stri_match_first_regex(raw_rec[(msg_idx+3):contents_idx], "^([^:]+):[[:space:]]+(.*)$")
+  tmp[,2] <- stri_trans_tolower(tmp[,2]) # lowercase the header key
+  tmp[,2] <- stri_replace_all_fixed(tmp[,2], "-", "_") # turn dashes to underscores so we can more easily use the keys as column names
+
+  contents <- raw_rec[(contents_idx+1):length(raw_rec)]
+  contents <- paste0(contents[contents != ""], collapse = "\n")
+
+  as.list(tmp[,3]) %>% # turn the header values into a list
+    set_names(tmp[,2]) %>% # make their names the tranformed keys
+    append(c(
+      source = source, # add source to the list (etc)
+      datetime = datetime,
+      opt_reg = list(opt_reg),
+      contents = contents
+    ))
+
+}) -> sip_log_parsed
+
+sip_log_parsed
+
+glimpse(sip_log_parsed)
+
+packet_cols <- c("packet_num", "ts", "src", "discard", "dst", "proto", "length", "info")
+
+read_tsv(
+  file = "voip-packets.tsv",
+  col_names = packet_cols,
+  col_types = "ddccccdc"
+) %>%
+  select(-discard) -> packets
+
+count(packets, proto, sort=TRUE)
+
+list.files(
+  pattern = "json$",
+  full.names = TRUE
+) %>%
+  walk(~assign(
+    x = tools::file_path_sans_ext(basename(.x)),
+    value = file(.x) %>%
+      jsonlite::stream_in(verbose = FALSE) %>%
+      as_tibble(),
+    envir = .GlobalEnv
+  ))
+
+ls()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
